@@ -70,6 +70,15 @@
 - 状态与规则持久化在 SQLite 中，重启不丢失；每次转换追加只增流水，
   (device_id, event_id) 唯一约束兜底——批次重试的重复事件在幂等去重阶段即跳过，不会重复产生状态变化。
 
+设备告警周期查询（只读）：
+- GET /devices/{device_id}/alert-episodes?start=&end= 供值班人员查看指定 UTC 时间段
+  （半开区间 [start, end)）内的告警周期与总告警秒数；start/end 必填且 end > start，
+  否则返回 422；设备或告警规则不存在返回 404，无相交周期返回空明细与 0。
+- 按告警转换流水的自增顺序把 entered、cleared 配对成周期，周期起止时刻取流水
+  记录的处理时刻 created_at；迟到事件只按处理顺序追加流水，不按 event_time 重排。
+- 只返回与 [start, end) 相交的周期，逐条给出进入/解除时刻与裁剪后的区间内秒数；
+  尚未解除的周期只计至 end 与查询时刻的较早者；total_seconds 为各明细秒数之和。
+
 设备缺报区间查询（只读）：
 - GET /devices/{device_id}/missing-windows?start=&end= 查询半开区间 [start, end) 内的连续缺报段，
   返回每段的起止时间与缺失窗口数；start/end 必须对齐设备窗口大小，end <= start 或未对齐返回 422，
@@ -136,7 +145,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.8.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.9.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -396,6 +405,23 @@ class AlertOut(BaseModel):
     entered_at: Optional[datetime] = None
     cleared_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class AlertEpisodeOut(BaseModel):
+    # 一个告警周期：按转换流水自增顺序配对的 entered/cleared 的处理时刻（created_at），
+    # 以及裁剪到查询区间 [start, end) 后的区间内秒数；尚未解除时 cleared_at 为 null
+    entered_at: datetime
+    cleared_at: Optional[datetime] = None
+    seconds: float
+
+
+class AlertEpisodesOut(BaseModel):
+    device_id: str
+    start: datetime
+    end: datetime
+    episodes: list[AlertEpisodeOut]
+    # 区间内总告警秒数 = 各明细 seconds 之和
+    total_seconds: float
 
 
 # ---------- 工具函数 ----------
@@ -1788,6 +1814,83 @@ def get_device_alert(device_id: str) -> AlertOut:
                 detail=f"no alert rule configured for device: {device_id}",
             )
         return build_alert_out(rule, get_alert_state(conn, device_id))
+
+
+@app.get("/devices/{device_id}/alert-episodes", response_model=AlertEpisodesOut)
+def list_alert_episodes(
+    device_id: str,
+    start: datetime = Query(..., description="统计范围下界（含），ISO 8601，不带时区按 UTC 处理"),
+    end: datetime = Query(..., description="统计范围上界（不含），ISO 8601，不带时区按 UTC 处理"),
+) -> AlertEpisodesOut:
+    """查询设备在半开区间 [start, end) 内的告警周期与总告警秒数（只读）。
+
+    按告警转换流水的自增顺序把 entered / cleared 配对成周期，周期起止时刻取流水
+    记录的处理时刻 created_at（迟到事件不按 event_time 重排）。只返回与 [start, end)
+    相交的周期，逐条给出进入/解除时刻与裁剪后的区间内秒数；尚未解除的周期只计至
+    end 与查询时刻的较早者。total_seconds 为各明细秒数之和。
+    start/end 必填且 end > start，否则 422；设备或告警规则不存在返回 404；
+    无相交周期返回空明细与 0。
+    """
+    start_ts = to_epoch(start)
+    end_ts = to_epoch(end)
+    if end_ts <= start_ts:
+        raise HTTPException(status_code=422, detail="end must be strictly greater than start")
+
+    now_ts = time.time()
+    with db.session() as conn:
+        require_device(conn, device_id)
+        if get_alert_rule(conn, device_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no alert rule configured for device: {device_id}",
+            )
+        rows = conn.execute(
+            "SELECT kind, created_at FROM device_alert_transitions"
+            " WHERE device_id = ? ORDER BY id",
+            (device_id,),
+        ).fetchall()
+
+    # 按流水自增顺序配对：entered 开启一个周期，下一条 cleared 将其闭合。
+    # 状态机保证 entered/cleared 严格交替，顺序配对即正确；迟到事件只按处理
+    # 顺序追加流水，不按 event_time 重排。
+    pairs: list[tuple[str, Optional[str]]] = []
+    pending_entered: Optional[str] = None
+    for r in rows:
+        if r["kind"] == "entered":
+            pending_entered = r["created_at"]
+        elif pending_entered is not None:
+            pairs.append((pending_entered, r["created_at"]))
+            pending_entered = None
+    if pending_entered is not None:
+        pairs.append((pending_entered, None))
+
+    episodes: list[AlertEpisodeOut] = []
+    total_seconds = 0.0
+    for entered_at, cleared_at in pairs:
+        entered_ts = datetime.fromisoformat(entered_at).timestamp()
+        if cleared_at is not None:
+            episode_end_ts = datetime.fromisoformat(cleared_at).timestamp()
+        else:
+            # 尚未解除的周期只计至 end 与查询时刻的较早者
+            episode_end_ts = min(now_ts, end_ts)
+        clip_start = max(entered_ts, start_ts)
+        clip_end = min(episode_end_ts, end_ts)
+        seconds = clip_end - clip_start
+        if seconds <= 0:
+            # 与 [start, end) 无交集（半开区间，端点相接或零长周期都不算相交）
+            continue
+        episodes.append(
+            AlertEpisodeOut(entered_at=entered_at, cleared_at=cleared_at, seconds=seconds)
+        )
+        total_seconds += seconds
+
+    return AlertEpisodesOut(
+        device_id=device_id,
+        start=start,
+        end=end,
+        episodes=episodes,
+        total_seconds=total_seconds,
+    )
 
 
 # ---------- 设备组接口 ----------

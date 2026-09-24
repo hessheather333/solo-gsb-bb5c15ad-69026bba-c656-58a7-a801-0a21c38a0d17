@@ -70,6 +70,17 @@
 - 状态与规则持久化在 SQLite 中，重启不丢失；每次转换追加只增流水，
   (device_id, event_id) 唯一约束兜底——批次重试的重复事件在幂等去重阶段即跳过，不会重复产生状态变化。
 
+设备告警周期查询（只读）：
+- GET /devices/{device_id}/alert-episodes?start=&end= 供值班人员查看指定 UTC 时间段
+  （半开区间 [start, end)）内相交的告警周期与总告警秒数。
+- 严格按转换流水自增顺序（id/created_at 写入顺序）将 entered 与随后 cleared 配对，
+  起止时刻取流水 created_at；迟到事件不按 event_time 重排（迟到的 entered 即便
+  event_time 更早，也只与流水中其后出现的 cleared 配对）。
+- 逐条返回进入/解除时刻与裁剪到区间内的秒数及实际相交区间；尚未解除的周期视为
+  开放区间，只计至 end 与查询时刻的较早者；总秒数为各周期裁剪后秒数之和。
+- start/end 必填且 end > start，否则 422；设备或告警规则不存在返回 404，
+  无相交周期返回空明细与零。
+
 设备缺报区间查询（只读）：
 - GET /devices/{device_id}/missing-windows?start=&end= 查询半开区间 [start, end) 内的连续缺报段，
   返回每段的起止时间与缺失窗口数；start/end 必须对齐设备窗口大小，end <= start 或未对齐返回 422，
@@ -136,7 +147,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.8.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.9.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -398,6 +409,29 @@ class AlertOut(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class AlertEpisodeOut(BaseModel):
+    # 一个完整告警周期：进入时刻与解除时刻（取转换流水的 created_at）；
+    # 尚未解除时 cleared_at 为 null，ongoing=true
+    entered_at: datetime
+    cleared_at: Optional[datetime] = None
+    ongoing: bool
+    # 周期与查询区间 [start, end) 相交后裁剪得到的区间内告警秒数（整数秒）
+    seconds_in_range: int
+    # 裁剪后的实际相交区间（半开）；ongoing 周期上界取 min(end, 查询时刻)
+    range_start: datetime
+    range_end: datetime
+
+
+class AlertEpisodesOut(BaseModel):
+    device_id: str
+    start: datetime
+    end: datetime
+    # 与 [start, end) 相交的告警周期，按进入时刻（流水自增顺序）升序
+    episodes: list[AlertEpisodeOut]
+    # 区间内总告警秒数：各周期裁剪后秒数之和
+    total_alert_seconds: int
+
+
 # ---------- 工具函数 ----------
 
 def to_epoch(dt: datetime) -> float:
@@ -415,6 +449,14 @@ def to_iso(ts: Optional[float]) -> Optional[str]:
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def created_at_to_epoch(text: str) -> float:
+    """告警转换流水 created_at（UTC ISO 8601 文本）-> epoch 秒；naive 按 UTC 处理。"""
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def window_floor(t: float, size: int) -> float:
@@ -1788,6 +1830,93 @@ def get_device_alert(device_id: str) -> AlertOut:
                 detail=f"no alert rule configured for device: {device_id}",
             )
         return build_alert_out(rule, get_alert_state(conn, device_id))
+
+
+@app.get("/devices/{device_id}/alert-episodes", response_model=AlertEpisodesOut)
+def list_device_alert_episodes(
+    device_id: str,
+    start: datetime = Query(..., description="统计范围下界（含），UTC ISO 8601"),
+    end: datetime = Query(..., description="统计范围上界（不含），UTC ISO 8601"),
+) -> AlertEpisodesOut:
+    """查询设备在半开区间 [start, end) 内相交的告警周期与总告警秒数（只读）。
+
+    周期配对严格按告警转换流水（device_alert_transitions）的自增顺序（id 升序，
+    即 created_at 的写入顺序）将 entered 与随后的 cleared 配对；**迟到事件不按
+    event_time 重排**——一个迟到的 entered 即使 event_time 更早，也只与流水上
+    在它之后出现的 cleared 配对。周期的进入/解除时刻取流水的 created_at（处理时刻）。
+
+    只返回与 [start, end) 相交的周期，逐条给出进入、解除时刻及裁剪到查询区间内的
+    秒数（seconds_in_range，整数秒）与裁剪后的实际相交区间（range_start/range_end）。
+    尚未解除（流水末尾停留于 entered）的周期视为开放区间，只计至 end 与查询时刻
+    的较早者；总秒数 total_alert_seconds 为各周期裁剪后秒数之和。
+
+    start/end 必填且 end 严格大于 start，否则 422；设备或告警规则不存在返回 404；
+    没有相交周期时返回空明细与总秒数 0。接口纯只读，不改动任何告警数据。
+    """
+    start_ts = to_epoch(start)
+    end_ts = to_epoch(end)
+    if end_ts <= start_ts:
+        raise HTTPException(status_code=422, detail="end must be strictly greater than start")
+    # 查询时刻在进入事务前取定一次：开放周期的计秒上界 = min(end, now)
+    now_ts = time.time()
+
+    with db.session() as conn:
+        require_device(conn, device_id)
+        if get_alert_rule(conn, device_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no alert rule configured for device: {device_id}",
+            )
+
+        rows = conn.execute(
+            "SELECT id, kind, created_at FROM device_alert_transitions"
+            " WHERE device_id = ? ORDER BY id",
+            (device_id,),
+        ).fetchall()
+
+    # 按流水自增顺序配对 entered -> cleared：用栈顺序消费，每个 entered 与之后
+    # 第一个使其归零的 cleared 成对；数据由状态机保证严格交替，此处同时兼容
+    # 末尾未解除（开放周期）与理论上的连续同态记录。
+    episodes: list[tuple[float, Optional[float]]] = []
+    open_entered: list[float] = []
+    for r in rows:
+        ts = created_at_to_epoch(r["created_at"])
+        if r["kind"] == "entered":
+            open_entered.append(ts)
+        elif open_entered:
+            episodes.append((open_entered.pop(0), ts))
+    for entered_ts in open_entered:
+        episodes.append((entered_ts, None))
+    episodes.sort(key=lambda ep: ep[0])
+
+    out_episodes: list[AlertEpisodeOut] = []
+    for entered_ts, cleared_ts in episodes:
+        # 周期为半开区间 [entered, cleared)；尚未解除时上界为 +inf
+        effective_end = cleared_ts if cleared_ts is not None else float("inf")
+        clip_start = max(entered_ts, start_ts)
+        clip_end = min(effective_end, end_ts)
+        if cleared_ts is None:
+            # 开放周期只计至 end 与查询时刻的较早者
+            clip_end = min(clip_end, now_ts)
+        if clip_end <= clip_start:
+            # 不相交（含仅在半开端点上相触，交集为空）
+            continue
+        out_episodes.append(AlertEpisodeOut(
+            entered_at=to_iso(entered_ts),
+            cleared_at=to_iso(cleared_ts),
+            ongoing=cleared_ts is None,
+            seconds_in_range=int(round(clip_end - clip_start)),
+            range_start=to_iso(clip_start),
+            range_end=to_iso(clip_end),
+        ))
+
+    return AlertEpisodesOut(
+        device_id=device_id,
+        start=to_iso(start_ts),
+        end=to_iso(end_ts),
+        episodes=out_episodes,
+        total_alert_seconds=sum(ep.seconds_in_range for ep in out_episodes),
+    )
 
 
 # ---------- 设备组接口 ----------

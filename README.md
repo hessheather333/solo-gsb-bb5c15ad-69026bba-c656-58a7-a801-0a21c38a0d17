@@ -72,6 +72,14 @@
 - **规则替换不改变状态**：PUT 新阈值只影响此后的事件评估，不会基于历史数据追溯、也不会令当前 `alerting` 翻转。
 - **持久化与防重**：规则、当前状态与每次状态转换流水都落盘在 SQLite 中（状态与聚合在**同一 ingest 写事务**内更新，ingest 使用 `BEGIN IMMEDIATE` 串行化并发批次），服务重启后状态原样恢复。状态转换只追加流水，且 `(device_id, event_id)` 上有唯一约束兜底；**批次重试中的重复事件在 ingest 幂等去重阶段即被跳过，绝不会第二次驱动状态机**（重启后重试亦然）。
 
+### 设备告警周期查询（只读）
+
+- **接口**：`GET /devices/{id}/alert-episodes?start=...&end=...`，供值班人员查看指定 **UTC** 时间段（半开区间 `[start, end)`）内与区间相交的告警周期及总告警秒数。`start`/`end` 均必填（ISO 8601）且 `end > start`，否则返回 `422`；设备不存在或设备未配置告警规则返回 `404`；没有任何相交周期时返回空明细与 `total_alert_seconds = 0`。
+- **配对只看流水顺序**：按现有告警转换流水 `device_alert_transitions` 的**自增顺序**（`id` 升序，即 `created_at` 的写入先后）将每个 `entered` 与流水中在它**之后**出现的 `cleared` 配成一个周期；周期的进入/解除时刻取**流水 `created_at`（事件处理时刻）**而非 `event_time`。**迟到事件不按 `event_time` 重排**：一个迟到的 `entered` 即使 `event_time` 更早，也只与流水上其后出现的 `cleared` 配对，不会被挪到历史位置。
+- **逐条裁剪、总秒数为明细之和**：只返回与 `[start, end)` 相交的周期，逐条给出 `entered_at`、`cleared_at`、裁剪后落在区间内的秒数 `seconds_in_range`（整数秒）与实际相交区间 `range_start`/`range_end`（均为半开）；`total_alert_seconds` 为各周期 `seconds_in_range` 之和。仅在半开端点上相触（周期在 `start` 处解除、或在 `end` 处进入）不算相交。
+- **尚未解除的周期**：流水末尾停留在 `entered`（设备当前仍告警中）时，该周期视为开放区间（`ongoing=true`、`cleared_at=null`），秒数只计至 **`end` 与查询时刻的较早者**，不会把未来时间计入。
+- 接口纯只读，不改动任何告警规则、状态与转换流水。
+
 ### 设备缺报区间查询（只读）
 
 - **接口**：`GET /devices/{id}/missing-windows?start=...&end=...` 查询半开区间 `[start, end)` 内的连续缺报段，返回每段的起止时间（`start` 为首个缺失窗口起点、`end` 为末个缺失窗口终点，半开）与缺失窗口数 `missing_windows`，按段起点升序。`start`/`end` 均必填且必须**对齐设备窗口大小**（如 60s 网格上的整分钟）；`end <= start` 或边界未对齐返回 `422`，设备不存在返回 `404`，设备尚无数据返回空列表。
@@ -694,6 +702,49 @@ curl 'http://localhost:8000/devices/sensor-001/daily-baseline?window_start=2026-
 - 目标窗口的迟到修正会原位更新其均值，**再次查询立即反映最新聚合与判定**。
 - `days` 仅允许 `3..30`、`threshold` 必须 `> 0`，否则 `422`；窗口秒数不能整除一天返回 `422`；设备/目标窗口不存在返回 `404`，目标窗口未封存返回 `409`。
 
+### 20. 查询告警周期与总告警秒数（值班视图）
+
+设备已配置告警规则并产生过状态转换后，按 **UTC** 半开区间查询相交的告警周期。以下面的流水为例（配对只看流水写入顺序，时刻取处理时刻 `created_at`）：
+
+- `entered` 09:00:10 → `cleared` 09:00:40（完整周期，30 秒）
+- `entered` 09:01:10 → 仍未解除（查询时持续中）
+
+```bash
+curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T09:00:00Z&end=2026-09-23T09:02:00Z'
+```
+
+```json
+{
+  "device_id": "sensor-001",
+  "start": "2026-09-23T09:00:00Z",
+  "end": "2026-09-23T09:02:00Z",
+  "episodes": [
+    {
+      "entered_at": "2026-09-23T09:00:10Z",
+      "cleared_at": "2026-09-23T09:00:40Z",
+      "ongoing": false,
+      "seconds_in_range": 30,
+      "range_start": "2026-09-23T09:00:10Z",
+      "range_end": "2026-09-23T09:00:40Z"
+    },
+    {
+      "entered_at": "2026-09-23T09:01:10Z",
+      "cleared_at": null,
+      "ongoing": true,
+      "seconds_in_range": 50,
+      "range_start": "2026-09-23T09:01:10Z",
+      "range_end": "2026-09-23T09:02:00Z"
+    }
+  ],
+  "total_alert_seconds": 80
+}
+```
+
+- 配对严格按转换流水自增顺序（`id`/`created_at` 的写入先后）：**迟到事件不按 `event_time` 重排**，迟到的 `entered` 即使事件时间更早也只与流水其后出现的 `cleared` 配对。
+- `range_start`/`range_end` 是周期与 `[start, end)` 裁剪后的实际相交区间，`seconds_in_range` 为其整数秒数；仅在端点相触（周期在 `start` 解除或在 `end` 进入）不算相交。
+- 尚未解除的周期 `ongoing=true`、`cleared_at=null`，秒数只计至 `end` 与查询时刻的较早者（上例查询时刻晚于 `end`，故计到 `end`）；`total_alert_seconds` 恒等于各周期 `seconds_in_range` 之和。
+- `start`/`end` 必填且 `end > start`，否则 `422`；设备或告警规则不存在返回 `404`；区间内无相交周期时返回 `{"episodes": [], "total_alert_seconds": 0}`。接口纯只读。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -713,6 +764,7 @@ curl 'http://localhost:8000/devices/sensor-001/daily-baseline?window_start=2026-
 | `GET` | `/devices/{device_id}/daily-baseline?window_start=&days=&threshold=` | 每日同窗基线偏移查询（只读；按 UTC 逐日同格回看已封存窗口，中位数/MAD 打分，缺失/未封存跳过不替代，有效样本 <3 返回 insufficient_samples，MAD=0 同值记 0/异值 score=null 且越界；days 3..30、threshold>0、窗口秒数不整除一天为 422，目标窗口不存在 404、未封存 409） |
 | `PUT` | `/devices/{device_id}/alert-rule` | 设置/替换高值告警双阈值（trigger 必须严格高于 recovery，均为有限数；非法 400 且旧规则保留，设备不存在 404） |
 | `GET` | `/devices/{device_id}/alert` | 查询当前告警状态与生效规则（无规则 404；状态持久化、重启不丢） |
+| `GET` | `/devices/{device_id}/alert-episodes?start=&end=` | UTC 半开区间内相交的告警周期与总告警秒数（只读；按转换流水自增顺序配对、取 created_at，迟到事件不按 event_time 重排；未解除周期计至 min(end, 查询时刻)；start/end 必填且 end>start 否则 422，设备或规则不存在 404，无相交周期返回空与零） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
 | `GET` | `/groups/{group_id}` | 组信息与成员列表 |
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
@@ -725,7 +777,7 @@ curl 'http://localhost:8000/devices/sensor-001/daily-baseline?window_start=2026-
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、设备缺报区间查询、每日同窗基线偏移查询逻辑
+  main.py        # FastAPI 应用、遥测聚合、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）与告警周期查询、设备缺报区间查询、每日同窗基线偏移查询逻辑
   db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器、告警规则/状态/转换流水表）、旧库迁移与事务会话
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
@@ -735,6 +787,7 @@ tests/
   test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 打分、MAD=0、404/409/422、只读）
   test_windows_search.py # 跨设备窗口检索测试（时间范围/状态/标签筛选、游标分页稳定性、400/422、只读）
   test_alerts.py    # 设备级高值告警测试（滞回转换/边界取等、非法阈值不覆盖旧规则、重试幂等、迟到驱动、重启持久化、唯一约束兜底）
+  test_alert_episodes.py # 告警周期查询测试（流水顺序配对/迟到不按 event_time 重排、半开区间裁剪、未解除周期计至 min(end,now)、总秒数为明细之和、422/404/空与零、只读）
   test_missing_windows.py # 设备缺报区间查询测试（缺报段计算/封存条件裁剪/半开边界/迟到填空拆分/422/404/只读）
   test_daily_baseline.py # 每日同窗基线偏移查询测试（UTC 同格回看/仅取已封存样本/不替代缺失/中位数/MAD 打分/样本不足/MAD=0 退化/迟到修正再查/整除校验/参数校验/404/409/只读）
 Dockerfile
